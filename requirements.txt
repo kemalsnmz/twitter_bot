@@ -1,0 +1,7 @@
+anthropic>=0.25.0
+tweepy>=4.14.0
+python-telegram-bot>=21.0
+feedparser>=6.0.10
+praw>=7.7.0
+schedule>=1.2.0
+python-dotenv>=1.0.0
