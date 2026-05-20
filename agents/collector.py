@@ -7,12 +7,16 @@ Yeni içerikleri content_queue tablosuna yazar.
 import feedparser
 import praw
 import tweepy
+import asyncio
 import re
 from datetime import datetime, timezone
 
 from config import (
     TOPICS,
     TWITTER_BEARER_TOKEN,
+    TWITTER_USERNAME,
+    TWITTER_EMAIL,
+    TWITTER_PASSWORD,
     REDDIT_CLIENT_ID,
     REDDIT_CLIENT_SECRET,
     MAX_ITEMS_PER_RUN,
@@ -183,6 +187,127 @@ def collect_reddit(topic_key: str, topic_cfg: dict) -> int:
     return added
 
 
+# ─── TWİKİT (API KEY GEREKMEDEN TWITTER) ─────────────────────────────────────
+
+COOKIES_FILE = "twikit_cookies.json"
+
+async def _get_twikit_client():
+    """Twikit client'ı başlat, cookie varsa kullan, yoksa login yap."""
+    from twikit import Client
+    import os
+
+    client = Client("en-US")
+    if os.path.exists(COOKIES_FILE):
+        client.load_cookies(COOKIES_FILE)
+    else:
+        if not TWITTER_USERNAME or not TWITTER_PASSWORD:
+            return None
+        await client.login(
+            auth_info_1=TWITTER_USERNAME,
+            auth_info_2=TWITTER_EMAIL or TWITTER_USERNAME,
+            password=TWITTER_PASSWORD,
+        )
+        client.save_cookies(COOKIES_FILE)
+    return client
+
+
+async def _collect_twikit_accounts(topic_key: str, topic_cfg: dict) -> int:
+    """Belirtilen Twitter hesaplarının son tweetlerini twikit ile topla."""
+    accounts = topic_cfg.get("twitter_accounts", [])
+    if not accounts:
+        return 0
+
+    keywords = topic_cfg["keywords"]
+    added = 0
+
+    try:
+        client = await _get_twikit_client()
+        if not client:
+            print("  [twikit] Hesap bilgileri eksik, atlanıyor.")
+            return 0
+
+        for username in accounts:
+            try:
+                user = await client.get_user_by_screen_name(username)
+                tweets = await user.get_tweets("Tweets", count=10)
+                for tweet in tweets:
+                    raw = tweet.full_text or tweet.text or ""
+                    if not is_relevant(raw, keywords):
+                        continue
+                    url = f"https://twitter.com/{username}/status/{tweet.id}"
+                    ok = insert_content(
+                        topic=topic_key,
+                        source_type="twitter",
+                        source_name=f"@{username}",
+                        title=raw[:100],
+                        url=url,
+                        raw_text=raw,
+                    )
+                    if ok:
+                        added += 1
+                        print(f"  [twikit] Eklendi: @{username} — {raw[:50]}")
+            except Exception as e:
+                print(f"  [twikit] Hata (@{username}): {e}")
+    except Exception as e:
+        print(f"  [twikit] Bağlantı hatası: {e}")
+
+    return added
+
+
+async def _collect_twikit_search(topic_key: str, topic_cfg: dict) -> int:
+    """Anahtar kelimelerle Twitter'da arama yap."""
+    keywords = topic_cfg.get("search_queries", topic_cfg["keywords"][:3])
+    added = 0
+
+    try:
+        client = await _get_twikit_client()
+        if not client:
+            return 0
+
+        for query in keywords[:3]:  # Max 3 sorgu
+            try:
+                results = await client.search_tweet(query, product="Latest", count=10)
+                for tweet in results:
+                    raw = tweet.full_text or tweet.text or ""
+                    if len(raw) < 50:  # Çok kısa tweetleri atla
+                        continue
+                    username = tweet.user.screen_name
+                    url = f"https://twitter.com/{username}/status/{tweet.id}"
+                    ok = insert_content(
+                        topic=topic_key,
+                        source_type="twitter_search",
+                        source_name=f"Twitter/{query[:30]}",
+                        title=raw[:100],
+                        url=url,
+                        raw_text=raw,
+                    )
+                    if ok:
+                        added += 1
+                        print(f"  [twikit] Arama '{query[:20]}': {raw[:50]}")
+            except Exception as e:
+                print(f"  [twikit] Arama hatası ('{query}'): {e}")
+    except Exception as e:
+        print(f"  [twikit] Arama bağlantı hatası: {e}")
+
+    return added
+
+
+def collect_twikit(topic_key: str, topic_cfg: dict) -> int:
+    """twikit koleksiyonunu senkron olarak çalıştır."""
+    if not TWITTER_USERNAME or not TWITTER_PASSWORD:
+        return 0
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        accounts = loop.run_until_complete(_collect_twikit_accounts(topic_key, topic_cfg))
+        search   = loop.run_until_complete(_collect_twikit_search(topic_key, topic_cfg))
+        loop.close()
+        return accounts + search
+    except Exception as e:
+        print(f"  [twikit] Genel hata: {e}")
+        return 0
+
+
 # ─── ANA FONKSİYON ───────────────────────────────────────────────────────────
 
 def run_collector():
@@ -199,6 +324,7 @@ def run_collector():
         total += collect_rss(topic_key, topic_cfg)
         total += collect_twitter(topic_key, topic_cfg)
         total += collect_reddit(topic_key, topic_cfg)
+        total += collect_twikit(topic_key, topic_cfg)
 
     print(f"\n[Toplayıcı Ajan] Bitti — Toplam {total} yeni içerik eklendi.")
     return total

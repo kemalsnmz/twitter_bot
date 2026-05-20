@@ -14,6 +14,10 @@ TELEGRAM_BOT_TOKEN      = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID        = os.getenv("TELEGRAM_CHAT_ID")
 REDDIT_CLIENT_ID        = os.getenv("REDDIT_CLIENT_ID")
 REDDIT_CLIENT_SECRET    = os.getenv("REDDIT_CLIENT_SECRET")
+STABILITY_API_KEY       = os.getenv("STABILITY_API_KEY")
+TWITTER_USERNAME        = os.getenv("TWITTER_USERNAME")
+TWITTER_EMAIL           = os.getenv("TWITTER_EMAIL")
+TWITTER_PASSWORD        = os.getenv("TWITTER_PASSWORD")
 
 # ─── KONULAR (NİŞLER) ────────────────────────────────────────────────────────
 # Her konuya kaynaklar ve tweet tonu tanımlanır.
@@ -30,11 +34,22 @@ TOPICS = {
         ),
         "rss_feeds": [
             "https://techcrunch.com/category/artificial-intelligence/feed/",
-            "https://www.theverge.com/ai-artificial-intelligence/rss/index.xml",
-            "https://www.wired.com/feed/tag/artificial-intelligence/rss",
-            "https://feeds.feedburner.com/venturebeat/SZYF",  # VentureBeat AI
+            "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml",
+            "https://feeds.feedburner.com/venturebeat/SZYF",
+            "https://www.technologyreview.com/feed/",
+            "https://feeds.arstechnica.com/arstechnica/technology-lab",
         ],
-        "twitter_accounts": [],  # Ucretli API gerektiriyor, devre disi
+        "twitter_accounts": [    # twikit ile ücretsiz çalışır
+            "OpenAI",
+            "AnthropicAI",
+            "GoogleDeepMind",
+            "sama",
+        ],
+        "search_queries": [      # twikit keyword araması
+            "yapay zeka",
+            "AI model 2025",
+            "LLM news",
+        ],
         "reddit_subs": [
             "artificial",
             "MachineLearning",

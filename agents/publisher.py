@@ -5,6 +5,9 @@ Onay gelince Twitter'a yayınlar.
 """
 
 import json
+import io
+import httpx
+import anthropic
 import tweepy
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -25,6 +28,8 @@ from config import (
     TWITTER_ACCESS_TOKEN,
     TWITTER_ACCESS_SECRET,
     TOPICS,
+    ANTHROPIC_API_KEY,
+    STABILITY_API_KEY,
 )
 from db.database import (
     get_pending_tweets,
@@ -36,6 +41,40 @@ from db.database import (
 
 # ConversationHandler state
 WAITING_EDIT = 1
+
+
+# ─── GÖRSEL ÜRETİCİ ─────────────────────────────────────────────────────────
+
+_TOPIC_HINTS = {
+    "ai": "artificial intelligence technology, neural network, futuristic digital art, blue purple tones",
+    "finance": "financial market, stock charts, business skyscrapers, professional photography",
+}
+
+def _make_image_prompt(title: str, topic: str) -> str:
+    hint = _TOPIC_HINTS.get(topic, "editorial news illustration, professional")
+    return f"{title[:120]}, {hint}, high quality, cinematic, no text, no watermark"
+
+
+def generate_image(title: str, topic: str) -> bytes | None:
+    """Stability AI ile 16:9 JPEG görsel üret. Başarılıysa bytes döndür."""
+    if not STABILITY_API_KEY:
+        return None
+    prompt = _make_image_prompt(title, topic)
+    try:
+        response = httpx.post(
+            "https://api.stability.ai/v2beta/stable-image/generate/core",
+            headers={"authorization": f"Bearer {STABILITY_API_KEY}", "accept": "image/*"},
+            data={"prompt": prompt, "output_format": "jpeg", "aspect_ratio": "16:9"},
+            timeout=45,
+        )
+        if response.status_code == 200:
+            print(f"  [Image] Gorsel uretildi ({len(response.content)//1024}KB)")
+            return response.content
+        print(f"  [Image] API hatasi: {response.status_code}")
+        return None
+    except Exception as e:
+        print(f"  [Image] Hata: {e}")
+        return None
 
 
 # ─── TWITTER YAYINLAYICı ────────────────────────────────────────────────────
@@ -71,47 +110,61 @@ def publish_to_twitter(tweet_text: str, source_url: str) -> str | None:
 
 # ─── TELEGRAM YARDIMCILAR ───────────────────────────────────────────────────
 
+def _get_editor_comment(item: dict, content: dict) -> str:
+    """Claude ile editör yorumu üret."""
+    try:
+        claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        response = claude.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=300,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Asagidaki haber icin kisaca Turkce editor yorumu yaz. "
+                    f"Haberin neyi ifade ettigini ve dikkat ceken noktasini 2-3 cumleyle ozet. "
+                    f"Sadece yorumu yaz, baslik veya etiket koyma.\n\n"
+                    f"Baslik: {content['title']}\n"
+                    f"Icerik: {content['raw_text'][:800]}"
+                ),
+            }],
+        )
+        return response.content[0].text.strip()
+    except Exception as e:
+        return f"Yorum uretilirken hata: {e}"
+
+
 def build_approval_message(item: dict) -> tuple[str, InlineKeyboardMarkup]:
-    """Onay mesajı ve butonlarını oluştur."""
+    """Onay mesajı, editör yorumu ve butonlarını oluştur."""
     alternatives = json.loads(item["alternatives"])
+    tweet_text   = alternatives[0]  # En iyi alternatifi kullan
     topic_label  = TOPICS.get(item["topic"], {}).get("label", item["topic"])
 
-    # Kaynak URL'yi content_queue'dan al
     conn = get_conn()
     content = conn.execute(
-        "SELECT url, source_name FROM content_queue WHERE id=?",
+        "SELECT url, source_name, title, raw_text FROM content_queue WHERE id=?",
         (item["content_id"],)
     ).fetchone()
     conn.close()
 
-    source_url  = content["url"]  if content else ""
+    source_url  = content["url"]        if content else ""
     source_name = content["source_name"] if content else ""
 
-    msg = f"🤖 *Yeni Tweet — {topic_label}*\n"
-    msg += f"📰 Kaynak: {source_name}\n"
-    msg += f"🔗 {source_url}\n\n"
+    # Editör yorumu üret
+    yorum = _get_editor_comment(item, dict(content)) if content else ""
+
+    msg = f"*Tweet Generator — {topic_label}* (ID: `{item['id']}`)\n"
+    msg += f"Kaynak: {source_name}\n"
+    msg += f"{source_url}\n\n"
+    if yorum:
+        msg += f"*Editor Yorumu:*\n_{yorum}_\n\n"
+    msg += "─────────────────\n"
+    msg += f"{tweet_text}\n"
     msg += "─────────────────\n"
 
-    for i, alt in enumerate(alternatives, 1):
-        msg += f"\n*{i}.* {alt}\n"
-
-    msg += "\n─────────────────\n"
-    msg += "Hangisini yayınlayalım?"
-
-    # Butonlar: her alternatif + düzenle + reddet
-    buttons = []
-    for i in range(len(alternatives)):
-        buttons.append(
-            InlineKeyboardButton(
-                f"✅ {i+1}. Tweet",
-                callback_data=f"approve_{item['id']}_{i}"
-            )
-        )
-
     keyboard = [
-        buttons,
+        [InlineKeyboardButton("✅ Yayinla", callback_data=f"approve_{item['id']}_0")],
         [
-            InlineKeyboardButton("✏️ Düzenle", callback_data=f"edit_{item['id']}"),
+            InlineKeyboardButton("✏️ Duzenle", callback_data=f"edit_{item['id']}"),
             InlineKeyboardButton("❌ Reddet",  callback_data=f"reject_{item['id']}"),
         ]
     ]
@@ -123,9 +176,10 @@ def build_approval_message(item: dict) -> tuple[str, InlineKeyboardMarkup]:
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Twitter Otomasyon Botu aktif!\n\n"
-        "/pending — Bekleyen tweetleri göster\n"
-        "/stats   — İstatistikler"
+        "Twitter Otomasyon Botu aktif!\n\n"
+        "/pending      — Bekleyen tweetleri goster\n"
+        "/yorum <id>   — O haber icin editor yorumu uret\n"
+        "/stats        — Istatistikler"
     )
 
 
@@ -134,19 +188,42 @@ async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     items = get_pending_tweets()
 
     if not items:
-        await update.message.reply_text("✅ Bekleyen tweet yok.")
+        await update.message.reply_text("Bekleyen tweet yok.")
         return
 
-    await update.message.reply_text(f"📋 {len(items)} bekleyen tweet var. Gönderiliyor...")
+    await update.message.reply_text(f"{len(items)} bekleyen tweet var. Gonderiliyor...")
 
     for item in items[:5]:  # Flood önlemi: max 5 adet
         msg, keyboard = build_approval_message(item)
-        sent = await update.message.reply_text(
-            msg,
-            parse_mode="Markdown",
-            reply_markup=keyboard,
-            disable_web_page_preview=True,
-        )
+
+        # Kaynak başlığını al (görsel için)
+        conn = get_conn()
+        row = conn.execute(
+            "SELECT title FROM content_queue WHERE id=?", (item["content_id"],)
+        ).fetchone()
+        conn.close()
+        title = row["title"] if row else ""
+
+        # Görsel üret
+        image_bytes = generate_image(title, item["topic"]) if title else None
+
+        if image_bytes:
+            # Caption max 1024 karakter — kırp gerekirse
+            caption = msg if len(msg) <= 1024 else msg[:1020] + "..."
+            sent = await update.message.reply_photo(
+                photo=io.BytesIO(image_bytes),
+                caption=caption,
+                parse_mode="Markdown",
+                reply_markup=keyboard,
+            )
+        else:
+            sent = await update.message.reply_text(
+                msg,
+                parse_mode="Markdown",
+                reply_markup=keyboard,
+                disable_web_page_preview=True,
+            )
+
         update_tweet_status(item["id"], "pending", telegram_msg_id=sent.message_id)
 
 
@@ -167,6 +244,72 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_yorum(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/yorum <queue_id> — O haberle ilgili editör yorumu üret."""
+    if not context.args:
+        await update.message.reply_text("Kullanim: /yorum <queue_id>\nOrnek: /yorum 6")
+        return
+
+    try:
+        queue_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Gecersiz ID. Ornek: /yorum 6")
+        return
+
+    item = get_tweet_by_id(queue_id)
+    if not item:
+        await update.message.reply_text(f"ID {queue_id} bulunamadi.")
+        return
+
+    conn = get_conn()
+    content = conn.execute(
+        "SELECT title, raw_text, url, source_name FROM content_queue WHERE id=?",
+        (item["content_id"],)
+    ).fetchone()
+    conn.close()
+
+    if not content:
+        await update.message.reply_text("Kaynak icerik bulunamadi.")
+        return
+
+    await update.message.reply_text("Yorum hazirlaniyor...")
+
+    try:
+        claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        response = claude.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=500,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Asagidaki haber icin kisaca Turkce editör yorumu yaz. "
+                    f"Haberin neyi ifade ettigini, sektöre etkisini ve dikkat ceken noktasini 3-4 cumleyle ozet. "
+                    f"Sadece yorumu yaz, baslik koyma.\n\n"
+                    f"Baslik: {content['title']}\n"
+                    f"Kaynak: {content['source_name']}\n"
+                    f"Icerik: {content['raw_text'][:1000]}"
+                ),
+            }],
+        )
+        yorum = response.content[0].text.strip()
+        await update.message.reply_text(
+            f"*Editör Yorumu — #{queue_id}*\n\n{yorum}\n\n🔗 {content['url']}",
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        await update.message.reply_text(f"Yorum uretilirken hata: {e}")
+
+
+async def _edit_msg(query, text: str, parse_mode=None, reply_markup=None):
+    """Fotoğraf veya metin mesajını uygun metotla güncelle."""
+    if query.message.photo:
+        caption = text if len(text) <= 1024 else text[:1020] + "..."
+        await query.edit_message_caption(caption=caption, parse_mode=parse_mode, reply_markup=reply_markup)
+    else:
+        await query.edit_message_text(text=text, parse_mode=parse_mode, reply_markup=reply_markup)
+
+
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Buton tıklamalarını işle."""
     query = update.callback_query
@@ -183,7 +326,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         item = get_tweet_by_id(tweet_queue_id)
         if not item:
-            await query.edit_message_text("❌ Tweet bulunamadı.")
+            await _edit_msg(query, "Tweet bulunamadi.")
             return
 
         alternatives = json.loads(item["alternatives"])
@@ -197,7 +340,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
         source_url = content["url"] if content else ""
 
-        await query.edit_message_text(f"⏳ Yayınlanıyor...")
+        await _edit_msg(query, "Yayinlaniyor...")
 
         tweet_id = publish_to_twitter(tweet_text, source_url)
 
@@ -209,27 +352,29 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 source_url=source_url,
                 topic=item["topic"],
             )
-            await query.edit_message_text(
-                f"🚀 *Tweet yayınlandı!*\n\n{tweet_text}\n\n"
-                f"🔗 https://twitter.com/i/web/status/{tweet_id}",
+            await _edit_msg(
+                query,
+                f"*Tweet yayinlandi!*\n\n{tweet_text}\n\n"
+                f"https://twitter.com/i/web/status/{tweet_id}",
                 parse_mode="Markdown",
             )
         else:
-            await query.edit_message_text("❌ Yayın başarısız. Twitter API hatası.")
+            await _edit_msg(query, "Yayin basarisiz. Twitter API hatasi.")
 
     # ── REDDET ──────────────────────────────────────────────
     elif action == "reject":
         tweet_queue_id = int(parts[1])
         update_tweet_status(tweet_queue_id, "rejected")
-        await query.edit_message_text("❌ Tweet reddedildi.")
+        await _edit_msg(query, "Tweet reddedildi.")
 
     # ── DÜZENLE ─────────────────────────────────────────────
     elif action == "edit":
         tweet_queue_id = int(parts[1])
         context.user_data["editing_id"] = tweet_queue_id
-        await query.edit_message_text(
-            "✏️ Yeni tweet metnini yaz (max 257 karakter).\n"
-            "URL otomatik eklenecek.\n\n/iptal ile vazgeç."
+        await _edit_msg(
+            query,
+            "Yeni tweet metnini yaz (max 257 karakter).\n"
+            "URL otomatik eklenecek.\n\n/iptal ile vazgec."
         )
         return WAITING_EDIT
 
@@ -289,34 +434,8 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── BOT BAŞLATMA ───────────────────────────────────────────────────────────
 
-def run_publisher():
-    """Telegram botunu başlat (blocking)."""
-    import asyncio
-    import httpx
-
-    print("[Yayıncı Ajan] Telegram botu başlatılıyor...")
-
-    # Telegram'daki eski polling oturumunu kapat
-    try:
-        with httpx.Client() as client:
-            client.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook",
-                json={"drop_pending_updates": True},
-                timeout=10,
-            )
-            # offset=-1 ile mevcut getUpdates oturumunu kapat
-            client.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
-                json={"offset": -1, "timeout": 0},
-                timeout=10,
-            )
-        print("[Yayıncı Ajan] Eski oturum temizlendi.")
-    except Exception as e:
-        print(f"[Yayıncı Ajan] Oturum temizleme hatası (devam ediliyor): {e}")
-
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-
-    # Düzenleme konuşması
+def _build_app():
+    """Application instance ve handler'ları oluştur."""
     edit_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(callback_handler, pattern="^edit_")],
         states={
@@ -326,15 +445,56 @@ def run_publisher():
         },
         fallbacks=[CommandHandler("iptal", cmd_cancel)],
     )
-
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start",   cmd_start))
     app.add_handler(CommandHandler("pending", cmd_pending))
     app.add_handler(CommandHandler("stats",   cmd_stats))
+    app.add_handler(CommandHandler("yorum",   cmd_yorum))
     app.add_handler(edit_conv)
     app.add_handler(CallbackQueryHandler(callback_handler))
+    return app
 
-    print("[Yayıncı Ajan] Bot aktif. /pending ile bekleyen tweetleri görüntüle.")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
+def _clear_telegram_session():
+    """Telegram sunucusundaki eski polling oturumunu kapat."""
+    import httpx, time
+    try:
+        with httpx.Client(timeout=10) as client:
+            client.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook",
+                json={"drop_pending_updates": True},
+            )
+            client.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+                json={"offset": -1, "timeout": 0},
+            )
+        time.sleep(2)
+        print("[Yayıncı Ajan] Eski oturum temizlendi.")
+    except Exception as e:
+        print(f"[Yayıncı Ajan] Oturum temizleme hatası: {e}")
+
+
+def run_publisher():
+    """Telegram botunu başlat (blocking). Conflict durumunda yeniden dener."""
+    import time
+    from telegram.error import Conflict
+
+    print("[Yayıncı Ajan] Telegram botu başlatılıyor...")
+    _clear_telegram_session()
+
+    for attempt in range(1, 6):
+        try:
+            app = _build_app()
+            print(f"[Yayıncı Ajan] Bot aktif (deneme {attempt}). /pending ile bekleyen tweetleri görüntüle.")
+            app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+            break
+        except Conflict:
+            wait = 10 * attempt
+            print(f"[Yayıncı Ajan] Conflict, {wait}s bekleniyor... ({attempt}/5)")
+            _clear_telegram_session()
+            time.sleep(wait)
+    else:
+        print("[Yayıncı Ajan] 5 denemede başlatılamadi. Botu elle yeniden calistir.")
 
 
 if __name__ == "__main__":

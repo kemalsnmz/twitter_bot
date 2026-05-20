@@ -4,3 +4,6 @@ __pycache__/
 *.db
 bot.log
 *.sqlite3
+node_modules/
+frontend/dist/
+twikit_cookies.json
